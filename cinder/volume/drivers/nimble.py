@@ -34,7 +34,7 @@ from cinder.openstack.common import units
 from cinder.volume.drivers.san.san import SanISCSIDriver
 
 
-DRIVER_VERSION = '1.0'
+DRIVER_VERSION = '1.0.1'
 VOL_EDIT_MASK = 4 + 16 + 32 + 64 + 512
 SOAP_PORT = 5391
 SM_ACL_APPLY_TO_BOTH = 3
@@ -73,7 +73,7 @@ class NimbleISCSIDriver(SanISCSIDriver):
 
     Version history:
         1.0 - Initial driver
-
+        1.0.1 - Correct capacity reporting
     """
 
     def __init__(self, *args, **kwargs):
@@ -264,11 +264,16 @@ class NimbleISCSIDriver(SanISCSIDriver):
             self.group_stats = {'volume_backend_name': backend_name,
                                 'vendor_name': 'Nimble',
                                 'driver_version': DRIVER_VERSION,
-                                'storage_protocol': 'iSCSI',
-                                'total_capacity_gb': total_capacity,
-                                'free_capacity_gb': free_space,
-                                'reserved_percentage': 0,
-                                'QoS_support': False}
+                                'storage_protocol': 'iSCSI'}
+            # Just use a single pool for now, FIXME to support multiple
+            # pools
+            single_pool = dict(
+                pool_name=backend_name,
+                total_capacity_gb=total_capacity,
+                free_capacity_gb=free_space,
+                reserved_percentage=0,
+                QoS_support=False)
+            self.group_stats['pools'] = [single_pool]
         return self.group_stats
 
     def extend_volume(self, volume, new_size):
