@@ -215,7 +215,9 @@ class NimbleDriverVolumeTestCase(NimbleDriverBaseTestCase):
             'provider_location': '172.18.108.21:3260 iqn.test 0',
             'provider_auth': None},
             self.driver.create_volume({'name': 'testvolume',
-                                       'size': 1}))
+                                       'size': 1,
+                                       'display_name': '',
+                                       'display_description': ''}))
         self.mock_client_service.service.createVol.assert_called_once_with(
             request={
                 'attr': {'snap-quota': 1073741824, 'warn-level': 858993459,
@@ -236,7 +238,9 @@ class NimbleDriverVolumeTestCase(NimbleDriverBaseTestCase):
             exception.VolumeBackendAPIException,
             self.driver.create_volume,
             {'name': 'testvolume',
-             'size': 1})
+             'size': 1,
+             'display_name': '',
+             'display_description': ''})
 
     @mock.patch(NIMBLE_URLLIB2)
     @mock.patch(NIMBLE_CLIENT)
@@ -326,15 +330,14 @@ class NimbleDriverVolumeTestCase(NimbleDriverBaseTestCase):
     def test_get_volume_stats(self):
         self.mock_client_service.service.getGroupConfig.return_value = \
             FAKE_POSITIVE_GROUP_CONFIG_RESPONSE
-        expected_res = {'driver_version': '1.0.1',
+        expected_res = {'driver_version': '1.0',
+                        'total_capacity_gb': 7466.30419921875,
+                        'QoS_support': False,
+                        'reserved_percentage': 0,
                         'vendor_name': 'Nimble',
                         'volume_backend_name': 'NIMBLE',
                         'storage_protocol': 'iSCSI',
-                        'pools': [{'pool_name': 'NIMBLE',
-                                   'total_capacity_gb': 7466.30419921875,
-                                   'free_capacity_gb': 7463.567649364471,
-                                   'reserved_percentage': 0,
-                                   'QoS_support': False}]}
+                        'free_capacity_gb': 7463.567649364471}
         self.assertEqual(
             expected_res,
             self.driver.get_volume_stats(refresh=True))
@@ -353,7 +356,9 @@ class NimbleDriverSnapshotTestCase(NimbleDriverBaseTestCase):
             FAKE_GENERIC_POSITIVE_RESPONSE
         self.driver.create_snapshot(
             {'volume_name': 'testvolume',
-             'name': 'testvolume-snap1'})
+             'name': 'testvolume-snap1',
+             'display_name': '',
+             'display_description': ''})
         self.mock_client_service.service.snapVol.assert_called_once_with(
             request={'vol': 'testvolume',
                      'snapAttr': {'name': 'testvolume-snap1',
