@@ -14,14 +14,13 @@
 #    under the License.
 """
 Volume driver for Nimble Storage.
-
 This driver supports Nimble Storage controller CS-Series.
-
 """
 import functools
 import random
 import re
 import string
+import time
 import urllib2
 
 from oslo_config import cfg
@@ -32,21 +31,31 @@ from suds import client
 from cinder import exception
 from cinder.i18n import _, _LE, _LI
 from cinder.volume.drivers.san import san
+from cinder.image import image_utils
+from cinder import utils
 
-
-DRIVER_VERSION = '1.0'
+DRIVER_VERSION = '1.0.3'
+VOL_DESC_EDIT_MASK = 2
 VOL_EDIT_MASK = 4 + 16 + 32 + 64 + 512
+ITO_PREFIX = 'ito-'
+ITO_DELETED = 'ITO_DELETED'
 SOAP_PORT = 5391
 SM_ACL_APPLY_TO_BOTH = 3
 SM_ACL_CHAP_USER_ANY = '*'
+SM_EAGAIN_SLEEP_SEC = 2
 SM_SUBNET_DATA = 3
 SM_SUBNET_MGMT_PLUS_DATA = 4
 LUN_ID = '0'
 WARN_LEVEL = 0.8
+RE_UUID = re.compile(".*[0-F]{8}-[0-F]{4}-[0-F]{4}-[0-F]{4}-[0-F]{12}.*",
+                     re.I)
 
 LOG = logging.getLogger(__name__)
 
 nimble_opts = [
+    cfg.StrOpt('nimble_ito_enabled',
+               default='false',
+               help='Nimble image transfer optimization enabled'),
     cfg.StrOpt('nimble_pool_name',
                default='default',
                help='Nimble Controller pool name'),
@@ -70,10 +79,11 @@ class NimbleAPIException(exception.VolumeBackendAPIException):
 class NimbleISCSIDriver(san.SanISCSIDriver):
 
     """OpenStack driver to enable Nimble Controller.
-
     Version history:
-        1.0 - Initial driver
-
+        1.0   - Initial driver
+        1.0.1 - Add Nimble image transfer optimization feature
+        1.0.2 - Add SM-eexist to the add_acl ignore list
+        1.0.3 - Modify for Kilo compatibility - Not production
     """
 
     def __init__(self, *args, **kwargs):
@@ -102,21 +112,21 @@ class NimbleISCSIDriver(san.SanISCSIDriver):
                 # Use the first data subnet, save mgmt+data for later
                 if (subnet['subnet-id']['type'] == SM_SUBNET_DATA):
                     LOG.info(_LI('Discovery ip %(disc_ip)s is used '
-                                 'on data subnet %(net_label)s')
+                               'on data subnet %(net_label)s')
                              % {'disc_ip': subnet['discovery-ip'],
                                 'net_label': subnet['label']})
                     return subnet['discovery-ip']
                 elif (subnet['subnet-id']['type'] ==
                         SM_SUBNET_MGMT_PLUS_DATA):
                     LOG.info(_LI('Discovery ip %(disc_ip)s is found'
-                                 ' on mgmt+data subnet %(net_label)s')
+                               ' on mgmt+data subnet %(net_label)s')
                              % {'disc_ip': subnet['discovery-ip'],
                                 'net_label': subnet['label']})
                     ret_discovery_ip = subnet['discovery-ip']
             # If subnet is specified and found, use the subnet
             elif subnet_label == subnet['label']:
                 LOG.info(_LI('Discovery ip %(disc_ip)s is used'
-                             ' on subnet %(net_label)s')
+                           ' on subnet %(net_label)s')
                          % {'disc_ip': subnet['discovery-ip'],
                             'net_label': subnet['label']})
                 return subnet['discovery-ip']
@@ -138,8 +148,8 @@ class NimbleISCSIDriver(san.SanISCSIDriver):
                 ip=self.configuration.san_ip)
         except Exception:
             LOG.error(_LE('Failed to create SOAP client.'
-                          'Check san_ip, username, password'
-                          ' and make sure the array version is compatible'))
+                        'Check san_ip, username, password'
+                        ' and make sure the array version is compatible'))
             raise
 
     def _get_provider_location(self, volume_name):
@@ -170,11 +180,49 @@ class NimbleISCSIDriver(san.SanISCSIDriver):
 
     def delete_volume(self, volume):
         """Delete the specified volume."""
+        # Add SM-ealready to the ignore list when offline
+        # volume in the delete volume workflow
         self.APIExecutor.online_vol(volume['name'], False,
-                                    ignore_list=['SM-enoent'])
+                                    ignore_list=['SM-enoent', 'SM-ealready'])
         self.APIExecutor.dissociate_volcoll(volume['name'],
                                             ignore_list=['SM-enoent'])
-        self.APIExecutor.delete_vol(volume['name'], ignore_list=['SM-enoent'])
+        if (self.configuration.nimble_ito_enabled.lower() == 'true'):
+            vol_info = self.APIExecutor.get_vol_info(volume['name'])
+            self._mark_ito_volume_deleted(volume['name'])
+        self.APIExecutor.delete_vol(volume['name'],
+                                    ignore_list=['SM-enoent', 'SM-ebusy'])
+        if (self.configuration.nimble_ito_enabled.lower() == 'true' and
+            vol_info['base-snap'] and
+            vol_info['base-snap'].startswith(ITO_PREFIX)):
+            self._handle_ito_volume_deleted(vol_info)
+
+    def _mark_ito_volume_deleted(self, volume_name):
+        """Mark ito volume deleted if found"""
+        snap_list = self.APIExecutor.get_snap_list(volume_name)
+        for snap in snap_list or []:
+            m = RE_UUID.match(snap['name'])
+            if m and snap['name'].startswith(ITO_PREFIX):
+                LOG.info(_LI('_handle_ito_volume_deleted found ito snap in '
+                         'vol %(vol)s and snap %(snap)s')
+                         % {'vol': volume_name,
+                         'snap': snap['name']})
+                self.APIExecutor.edit_vol(
+                    volume_name,
+                    VOL_DESC_EDIT_MASK,
+                    {'description': ITO_DELETED})
+                return
+
+    def _handle_ito_volume_deleted(self, vol_info):
+        """Handle ito parent volume deletion"""
+        parent_vol_info = self.APIExecutor.get_vol_info(vol_info['parent-vol'])
+        if (parent_vol_info['description'] == ITO_DELETED):
+            LOG.info(_LI('base-snap %(snap)s parent-vol %(vol)s desc %(desc)s')
+                     % {'snap': vol_info['base-snap'],
+                    'vol': parent_vol_info['name'],
+                    'desc': parent_vol_info['description']})
+            self.APIExecutor.delete_vol(vol_info['parent-vol'],
+                                        ignore_list =['SM-enoent', 'SM-ebusy'])
+            return
 
     def _generate_random_string(self, length):
         """Generates random_string."""
@@ -228,11 +276,9 @@ class NimbleISCSIDriver(san.SanISCSIDriver):
 
     def delete_snapshot(self, snapshot):
         """Delete a snapshot."""
-        self.APIExecutor.online_snap(
-            snapshot['volume_name'],
-            False,
-            snapshot['name'],
-            ignore_list=['SM-ealready', 'SM-enoent'])
+        self.APIExecutor.online_snap(snapshot['volume_name'], False,
+                                     snapshot['name'],
+                                     ignore_list=['SM-ealready', 'SM-enoent'])
         self.APIExecutor.delete_snap(snapshot['volume_name'],
                                      snapshot['name'],
                                      ignore_list=['SM-enoent'])
@@ -293,8 +339,7 @@ class NimbleISCSIDriver(san.SanISCSIDriver):
     def _create_igroup_for_initiator(self, initiator_name):
         """Creates igroup for an initiator and returns the igroup name."""
         igrp_name = 'openstack-' + self._generate_random_string(12)
-        LOG.info(_LI('Creating initiator group %(grp)s '
-                     'with initiator %(iname)s')
+        LOG.info(_LI('Creating initiator group %(grp)s with initiator %(iname)s')
                  % {'grp': igrp_name, 'iname': initiator_name})
         self.APIExecutor.create_initiator_group(igrp_name, initiator_name)
         return igrp_name
@@ -306,8 +351,7 @@ class NimbleISCSIDriver(san.SanISCSIDriver):
                 if (len(initiator_group['initiator-list']) == 1 and
                     initiator_group['initiator-list'][0]['name'] ==
                         initiator_name):
-                    LOG.info(_LI('igroup %(grp)s found for '
-                                 'initiator %(iname)s')
+                    LOG.info(_LI('igroup %(grp)s found for initiator %(iname)s')
                              % {'grp': initiator_group['name'],
                                 'iname': initiator_name})
                     return initiator_group['name']
@@ -317,7 +361,7 @@ class NimbleISCSIDriver(san.SanISCSIDriver):
     def initialize_connection(self, volume, connector):
         """Driver entry point to attach a volume to an instance."""
         LOG.info(_LI('Entering initialize_connection volume=%(vol)s'
-                     ' connector=%(conn)s location=%(loc)s')
+                   ' connector=%(conn)s location=%(loc)s')
                  % {'vol': volume,
                     'conn': connector,
                     'loc': volume['provider_location']})
@@ -329,7 +373,8 @@ class NimbleISCSIDriver(san.SanISCSIDriver):
                 initiator_name)
         LOG.info(_LI('Initiator group name is %(grp)s for initiator %(iname)s')
                  % {'grp': initiator_group_name, 'iname': initiator_name})
-        self.APIExecutor.add_acl(volume, initiator_group_name)
+        self.APIExecutor.add_acl(volume, initiator_group_name,
+                                 ignore_list=['SM-eexist'])
         (iscsi_portal, iqn, lun_num) = volume['provider_location'].split()
         properties = {}
         properties['target_discovered'] = False  # whether discovery was used
@@ -345,7 +390,7 @@ class NimbleISCSIDriver(san.SanISCSIDriver):
     def terminate_connection(self, volume, connector, **kwargs):
         """Driver entry point to unattach a volume from an instance."""
         LOG.info(_LI('Entering terminate_connection volume=%(vol)s'
-                     ' connector=%(conn)s location=%(loc)s.')
+                   ' connector=%(conn)s location=%(loc)s.')
                  % {'vol': volume,
                     'conn': connector,
                     'loc': volume['provider_location']})
@@ -356,8 +401,95 @@ class NimbleISCSIDriver(san.SanISCSIDriver):
             raise NimbleDriverException(
                 _('No initiator group found for initiator %s') %
                 initiator_name)
-        self.APIExecutor.remove_acl(volume, initiator_group_name)
+        self.APIExecutor.remove_acl(volume, initiator_group_name,
+                                    ignore_list=['SM-enoent'])
+        # This is workaround for the case where nova/cinder
+        # does not logout the iSCSI target and connection
+        # properly. As a result, the target cannot be re-attach
+        # again due to single multi initiator set as default
+        self.APIExecutor.online_vol(volume['name'], False,
+                                    ignore_list=['SM-enoent'])
+        time.sleep(1)
+        self.APIExecutor.online_vol(volume['name'], True,
+                                    ignore_list=['SM-enoent'])
 
+    def _find_image_in_snap(self, image_id):
+        """Check to see if there is an existing image snap"""
+        LOG.info(_LI('Entering _find_image_in_snap with image_id %s')
+                 % image_id)
+        vol_list = self.APIExecutor.get_vol_list(
+            self.configuration.nimble_pool_name)
+        for vol in vol_list:
+            m = RE_UUID.match(vol['name'])
+            if m:
+                snapshot_name = (ITO_PREFIX + image_id)
+                snap = self.APIExecutor.get_snap_info(vol['name'],
+                                                      snapshot_name)
+                if (snap['name'] == snapshot_name):
+                    LOG.info(_LI('image_id snap %(snap)s found in vol %(vol)s')
+                             % {'snap': snap['name'], 'vol': vol['name']})
+                    return snap
+        return None
+
+    def clone_image(self, context, volume, image_location, image_meta, image_service):
+        """Create a volume efficiently from an existing image.
+
+        image_location is a string whose format depends on the
+        image service backend in use. The driver should use it
+        to determine whether cloning is possible.
+
+        image_meta is the metadata for the image and contains 
+	the image_id that is a string representing id of the image.
+
+        Returns a dict of volume properties eg. provider_location,
+        boolean indicating whether cloning occurred.
+        """
+        if (self.configuration.nimble_ito_enabled.lower() != 'true'):
+            return None, False
+	image_id = image_meta['id']
+        LOG.info(_LI('Entering clone_image volume=%(vol)s'
+                   ' image_location=%(il)s image_id=%(ii)s.')
+                 % {'vol': volume['name'],
+                    'il': image_location,
+                    'ii': image_id})
+        cloned = False
+        share = None
+        nimble_snap = self._find_image_in_snap(image_id)
+        if nimble_snap:
+            snapshot = {'volume_name': nimble_snap['vol'],
+                        'name': nimble_snap['name'],
+                        'volume_size': nimble_snap['size'] / units.Gi}
+            cloned = self._clone_volume_from_snapshot(volume, snapshot)
+        else:
+            return None, False
+        loc = cloned['provider_location'] if cloned else None
+        bootable = True if cloned else False
+        return {'provider_location': loc, 'bootable': bootable}, cloned
+
+    def copy_image_to_volume(self, context, volume, image_service, image_id):
+        """Fetch the image from image_service and write it to the volume."""
+        LOG.info(_LI('Entering copy_image_to_volume volume=%(vol)s'
+                   ' image_service=%(is)s image_id=%(ii)s.')
+                 % {'vol': volume['name'],
+                    'is': image_service,
+                    'ii': image_id})
+        properties = utils.brick_get_connector_properties()
+        attach_info, volume = self._attach_volume(context, volume, properties)
+        try:
+            image_utils.fetch_to_raw(context,
+                                     image_service,
+                                     image_id,
+                                     attach_info['device']['path'],
+                                     self.configuration.volume_dd_blocksize,
+                                     size=volume['size'])
+            if (self.configuration.nimble_ito_enabled.lower() == 'true'):
+                snapshot_name = (ITO_PREFIX + image_id)
+                snapshot = {'volume_name': volume['name'],
+                            'name': snapshot_name,
+                            'volume_size': volume['size']}
+                self.APIExecutor.snap_vol(snapshot)
+        finally:
+            self._detach_volume(context, attach_info, volume, properties)
 
 def _response_checker(func):
     """Decorator function to check if the response
@@ -391,8 +523,12 @@ def _connection_checker(func):
             except NimbleAPIException as e:
                 if attempts < 1 and (re.search('SM-eaccess', str(e))):
                     LOG.info(_LI('Session might have expired.'
-                                 ' Trying to relogin'))
+                               ' Trying to relogin'))
                     self.login()
+                    continue
+                elif attempts < 1 and (re.search('SM-eagain', str(e))):
+                    LOG.info(_LI('SM-eagain sleep and retry'))
+                    time.sleep(SM_EAGAIN_SLEEP_SEC)
                     continue
                 else:
                     LOG.error(_LE('Re-throwing Exception %s') % e)
@@ -475,12 +611,13 @@ class NimbleAPIExecutor(object):
         display_list = [getattr(volume, 'display_name', ''),
                         getattr(volume, 'display_description', '')]
         description = ':'.join(filter(None, display_list))
+
         # Limit description size to 254 characters
         description = description[:254]
 
         LOG.info(_LI('Creating a new volume=%(vol)s size=%(size)s'
-                     ' reserve=%(reserve)s in pool=%(pool)s'
-                     ' description=%(description)s')
+                   ' reserve=%(reserve)s in pool=%(pool)s'
+                   ' description=%(description)s')
                  % {'vol': volume['name'],
                     'size': volume_size,
                     'reserve': reserve,
@@ -519,10 +656,10 @@ class NimbleAPIExecutor(object):
 
     @_connection_checker
     @_response_checker
-    def add_acl(self, volume, initiator_group_name):
+    def add_acl(self, volume, initiator_group_name, *args, **kwargs):
         """Execute addAcl API."""
         LOG.info(_LI('Adding ACL to volume=%(vol)s with'
-                     ' initiator group name %(igrp)s')
+                   ' initiator group name %(igrp)s')
                  % {'vol': volume['name'],
                     'igrp': initiator_group_name})
         return self.client.service.addVolAcl(
@@ -534,10 +671,10 @@ class NimbleAPIExecutor(object):
 
     @_connection_checker
     @_response_checker
-    def remove_acl(self, volume, initiator_group_name):
+    def remove_acl(self, volume, initiator_group_name, *args, **kwargs):
         """Execute removeVolAcl API."""
         LOG.info(_LI('Removing ACL from volume=%(vol)s'
-                     ' for initiator group %(igrp)s')
+                   ' for initiator group %(igrp)s')
                  % {'vol': volume['name'],
                     'igrp': initiator_group_name})
         return self.client.service.removeVolAcl(
@@ -549,18 +686,66 @@ class NimbleAPIExecutor(object):
 
     @_connection_checker
     @_response_checker
-    def _execute_get_vol_info(self, vol_name):
-        LOG.info(_LI('Getting volume information '
-                     'for vol_name=%s') % (vol_name))
+    def _execute_get_vol_info(self, vol_name, *args, **kwargs):
+        LOG.info(_LI('Getting volume information for vol_name=%s') % (vol_name))
         return self.client.service.getVolInfo(request={'sid': self.sid,
                                                        'name': vol_name})
 
     def get_vol_info(self, vol_name):
         """Execute getVolInfo API."""
-        response = self._execute_get_vol_info(vol_name)
+        response = self._execute_get_vol_info(vol_name,
+                                              ignore_list=['SM-enoent'])
         LOG.info(_LI('Successfully got volume information for volume %s')
                  % vol_name)
-        return response['vol']
+        return (response['vol'] if 'vol' in response else [])
+
+    @_connection_checker
+    @_response_checker
+    def _execute_get_snap_info(self, vol_name, snap_name, *args, **kwargs):
+        LOG.info(_LI('Getting volume %(vol)s snap %(snap)s info')
+                 % {'vol': vol_name, 'snap': snap_name})
+        return self.client.service.getSnapInfo(request={'sid': self.sid,
+                                                        'vol': vol_name,
+                                                        'name': snap_name})
+
+    def get_snap_info(self, vol_name, snap_name):
+        """Execute getSnapInfo API."""
+        response = self._execute_get_snap_info(vol_name, snap_name,
+                                               ignore_list=['SM-enoent'])
+        LOG.info(_LI('Successfully got snapshot information for volume %s')
+                 % vol_name)
+        return (response['snap'] if 'snap' in response else [])
+
+    @_connection_checker
+    @_response_checker
+    def _execute_get_vol_list(self, pool_name):
+        LOG.info(_LI('Getting volume list in pool_name=%s') % (pool_name))
+        return self.client.service.getVolList(request={'sid': self.sid,
+                                                       'pool': pool_name})
+
+    def get_vol_list(self, pool_name):
+        """Execute getVolList API."""
+        response = self._execute_get_vol_list(pool_name)
+        LOG.info(_LI('Successfully got volume list in pool %s')
+                 % pool_name)
+        return (response['volume-list']
+                if 'volume-list' in response else [])
+
+    @_connection_checker
+    @_response_checker
+    def _execute_get_snap_list(self, volume_name, *args, **kwargs):
+        LOG.info(_LI('Getting snap list in volume_name=%s') % (volume_name))
+        return self.client.service.getSnapList(request={'sid': self.sid,
+                                                        'vol': volume_name})
+
+    def get_snap_list(self, volume_name):
+        """Execute getSnapList API."""
+        response = self._execute_get_snap_list(volume_name,
+                                               ignore_list=['SM-enoent'])
+        LOG.info(_LI('Successfully got snap list in volume %s')
+                 % volume_name)
+        return (response['snapList']
+                if 'snapList' in response else [])
 
     @_connection_checker
     @_response_checker
@@ -610,10 +795,11 @@ class NimbleAPIExecutor(object):
         display_list = [getattr(snapshot, 'display_name', ''),
                         getattr(snapshot, 'display_description', '')]
         snap_description = ':'.join(filter(None, display_list))
+
         # Limit to 254 characters
         snap_description = snap_description[:254]
         LOG.info(_LI('Creating snapshot for volume_name=%(vol)s'
-                     ' snap_name=%(name)s snap_description=%(desc)s')
+                   ' snap_name=%(name)s snap_description=%(desc)s')
                  % {'vol': volume_name,
                     'name': snap_name,
                     'desc': snap_description})
@@ -642,8 +828,8 @@ class NimbleAPIExecutor(object):
         snap_size = snapshot['volume_size']
         reserve_size = snap_size * units.Gi if reserve else 0
         LOG.info(_LI('Cloning volume from snapshot volume=%(vol)s '
-                     'snapshot=%(snap)s clone=%(clone)s snap_size=%(size)s'
-                     'reserve=%(reserve)s')
+                   'snapshot=%(snap)s clone=%(clone)s snap_size=%(size)s'
+                   'reserve=%(reserve)s')
                  % {'vol': volume_name,
                     'snap': snap_name,
                     'clone': clone_name,
@@ -692,7 +878,7 @@ class NimbleAPIExecutor(object):
     def create_initiator_group(self, initiator_group_name, initiator_name):
         """Execute createInitiatorGrp API."""
         LOG.info(_LI('Creating initiator group %(igrp)s'
-                     ' with one initiator %(iname)s')
+                   ' with one initiator %(iname)s')
                  % {'igrp': initiator_group_name, 'iname': initiator_name})
         return self.client.service.createInitiatorGrp(
             request={'sid': self.sid,
